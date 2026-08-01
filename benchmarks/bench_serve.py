@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """对 OpenAI 兼容端点做 TTFT / 吞吐压测。
 
-零依赖（仅 stdlib），可从 Windows 直接压 WSL 内的服务。
+零依赖（仅 stdlib）。
+
+⚠️ **必须在 WSL 内运行**（与 vLLM 服务同侧）。从 Windows 侧压测会引入两项与
+被测系统无关的干扰，实测数据见 docs/phase1-baseline.md 第 6 节：
+
+  - 用 localhost 时先解析 IPv6 ::1，等超时回退 IPv4 约 2.1 秒
+  - 经 WSL2 端口转发存在约 42 ms 的固定延迟，与 prompt 大小无关
+
+    cd /mnt/c/.../kvcache-lab && python3 benchmarks/bench_serve.py ...
 
 两类指标对应两个阶段的瓶颈（见 docs/notes/04-serving.md）：
 
@@ -28,6 +36,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import socket
 import statistics
 import threading
 import time
@@ -94,13 +103,69 @@ def build_prompt(index: int, corpus: Corpus, doc_chars: int, shared: bool) -> st
     return f"[会话 {index}-{time.time_ns()}]\n{body}"
 
 
-def one_request(url: str, model: str, prompt: str, output_len: int,
-                timeout: float) -> Result:
-    """发一个流式请求，测量 TTFT 与端到端延迟。"""
-    parsed = urlparse(url)
-    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(parsed.hostname, parsed.port, timeout=timeout)
+# vLLM /metrics 中的前缀缓存计数器（累计值，压测前后取差得到本次数据）。
+# external_* 对应 KV Connector / LMCache 等外部缓存层，Phase 3 起才非零。
+_METRIC_KEYS = {
+    "vllm:prefix_cache_queries_total": "queries",
+    "vllm:prefix_cache_hits_total": "hits",
+    "vllm:external_prefix_cache_queries_total": "ext_queries",
+    "vllm:external_prefix_cache_hits_total": "ext_hits",
+}
 
+
+def read_metrics(url: str, timeout: float = 10.0) -> dict[str, float]:
+    """读取前缀缓存计数器；端点不可用时返回空字典，不影响压测。"""
+    parsed = urlparse(url)
+    conn_cls = (http.client.HTTPSConnection if parsed.scheme == "https"
+                else http.client.HTTPConnection)
+    conn = conn_cls(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        conn.request("GET", "/metrics")
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return {}
+        out: dict[str, float] = {}
+        for line in resp.read().decode("utf-8").splitlines():
+            if line.startswith("#") or " " not in line:
+                continue
+            key = _METRIC_KEYS.get(line.split("{")[0].split(" ")[0])
+            if key:
+                try:
+                    out[key] = float(line.rsplit(" ", 1)[1])
+                except ValueError:
+                    pass
+        return out
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def new_connection(url: str, timeout: float) -> http.client.HTTPConnection:
+    """建立连接并关闭 Nagle 算法。
+
+    必须设置 TCP_NODELAY：http.client 分多次写入请求头与 body，Nagle 会压住
+    后续小包等待前一包的 ACK，与对端的延迟 ACK 定时器叠加，产生约 40 ms 的
+    固定停顿。实测 Windows→WSL 路径上该停顿使 TTFT 恒定虚高约 42 ms，
+    且不随 prompt 大小变化。
+    """
+    parsed = urlparse(url)
+    conn_cls = (http.client.HTTPSConnection if parsed.scheme == "https"
+                else http.client.HTTPConnection)
+    conn = conn_cls(parsed.hostname, parsed.port, timeout=timeout)
+    conn.connect()
+    conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return conn
+
+
+def one_request(conn: http.client.HTTPConnection, model: str, prompt: str,
+                output_len: int) -> Result:
+    """在已有连接上发一个流式请求，测量 TTFT 与端到端延迟。
+
+    连接复用是必须的：新建 TCP 连接经 WSL2 端口转发约需 14 ms，
+    而 WSL 内部 loopback 仅 0.07 ms。若每请求新建连接，这段开销会直接
+    计入 TTFT，在缓存命中场景下甚至超过 TTFT 本身。
+    """
     payload = json.dumps({
         "model": model,
         "prompt": prompt,
@@ -137,12 +202,12 @@ def one_request(url: str, model: str, prompt: str, output_len: int,
             if not ttft and chunk.get("choices") and chunk["choices"][0].get("text"):
                 ttft = time.perf_counter() - start
 
+        # 排空剩余字节，保持连接可复用（keep-alive）
+        resp.read()
         return Result(True, ttft, time.perf_counter() - start,
                       prompt_tokens, output_tokens)
     except Exception as exc:
         return Result(False, error=f"{type(exc).__name__}: {exc}")
-    finally:
-        conn.close()
 
 
 def run(args, corpus: Corpus) -> list[Result]:
@@ -153,18 +218,26 @@ def run(args, corpus: Corpus) -> list[Result]:
     next_index = [0]
 
     def worker():
-        while True:
-            with counter:
-                i = next_index[0]
-                if i >= args.num_requests:
-                    return
-                next_index[0] += 1
-            prompt = build_prompt(i, corpus, args.doc_chars, args.shared)
-            r = one_request(args.url, args.model, prompt, args.output_len, args.timeout)
-            with lock:
-                results.append(r)
-                done = len(results)
-            print(f"\r  {done}/{args.num_requests}", end="", flush=True)
+        conn = new_connection(args.url, args.timeout)  # 每个 worker 一条长连接
+        try:
+            while True:
+                with counter:
+                    i = next_index[0]
+                    if i >= args.num_requests:
+                        return
+                    next_index[0] += 1
+                prompt = build_prompt(i, corpus, args.doc_chars, args.shared)
+                r = one_request(conn, args.model, prompt, args.output_len)
+                if not r.ok:
+                    # 连接状态可能已损坏，重建后继续
+                    conn.close()
+                    conn = new_connection(args.url, args.timeout)
+                with lock:
+                    results.append(r)
+                    done = len(results)
+                print(f"\r  {done}/{args.num_requests}", end="", flush=True)
+        finally:
+            conn.close()
 
     threads = [threading.Thread(target=worker, daemon=True)
                for _ in range(args.concurrency)]
@@ -181,6 +254,28 @@ def pct(values: list[float], p: float) -> float:
         return 0.0
     ordered = sorted(values)
     return ordered[min(int(len(ordered) * p), len(ordered) - 1)]
+
+
+def report_cache(before: dict[str, float], after: dict[str, float]) -> None:
+    """打印本次压测期间的前缀缓存命中情况（取计数器差值）。"""
+    if not before or not after:
+        print("\n前缀缓存     metrics 端点不可用，跳过")
+        return
+
+    q = after.get("queries", 0) - before.get("queries", 0)
+    h = after.get("hits", 0) - before.get("hits", 0)
+    if q <= 0:
+        print("\n前缀缓存     本次无查询记录")
+        return
+
+    print(f"\n前缀缓存     查询 {q:,.0f} token   命中 {h:,.0f} token"
+          f"   命中率 {h / q * 100:.1f}%")
+
+    eq = after.get("ext_queries", 0) - before.get("ext_queries", 0)
+    if eq > 0:
+        eh = after.get("ext_hits", 0) - before.get("ext_hits", 0)
+        print(f"外部缓存层   查询 {eq:,.0f}   命中 {eh:,.0f}"
+              f"   命中率 {eh / eq * 100:.1f}%")
 
 
 def report(results: list[Result], wall: float, args) -> None:
@@ -227,11 +322,15 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description="TTFT / 吞吐压测（OpenAI 兼容端点）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--url", default="http://localhost:8000", help="服务地址")
+    # 必须用 127.0.0.1 而非 localhost：Windows 上 localhost 先解析为 IPv6 ::1，
+    # 而 WSL2 的端口转发只监听 IPv4，等超时回退需约 2.1 秒，会完全淹没真实 TTFT。
+    p.add_argument("--url", default="http://127.0.0.1:8000", help="服务地址")
     p.add_argument("--model", required=True, help="服务端注册的模型名")
     p.add_argument("-n", "--num-requests", type=int, default=32)
     p.add_argument("-c", "--concurrency", type=int, default=8)
-    p.add_argument("--output-len", type=int, default=128, help="max_tokens")
+    # 输出长度直接决定输入输出比，而该比值强烈影响前缀缓存的收益幅度。
+    # 512 接近真实问答场景；system.txt 对长度保持中立，故长度仅由本参数控制。
+    p.add_argument("--output-len", type=int, default=512, help="max_tokens")
     p.add_argument("--doc-chars", type=int, default=4000,
                    help="取文档前 N 字符作为上下文（0 表示全文）")
     p.add_argument("--shared", action="store_true",
@@ -249,19 +348,28 @@ def main() -> int:
 
     if args.warmup:
         print(f"预热 {args.warmup} 个请求...")
-        for i in range(args.warmup):
-            # 预热一律用不命中模式，避免污染后续的共享前缀测量
-            r = one_request(args.url, args.model,
-                            build_prompt(-i - 1, corpus, args.doc_chars, False),
-                            args.output_len, args.timeout)
-            if not r.ok:
-                print(f"预热失败: {r.error}")
-                return 1
+        conn = new_connection(args.url, args.timeout)
+        try:
+            for i in range(args.warmup):
+                # 预热一律用不命中模式，避免污染后续的共享前缀测量
+                r = one_request(conn, args.model,
+                                build_prompt(-i - 1, corpus, args.doc_chars, False),
+                                args.output_len)
+                if not r.ok:
+                    print(f"预热失败: {r.error}")
+                    return 1
+        finally:
+            conn.close()
 
     print(f"压测中（并发 {args.concurrency}）...")
+    metrics_before = read_metrics(args.url)
     start = time.perf_counter()
     results = run(args, corpus)
-    report(results, time.perf_counter() - start, args)
+    wall = time.perf_counter() - start
+    metrics_after = read_metrics(args.url)
+
+    report(results, wall, args)
+    report_cache(metrics_before, metrics_after)
     return 0 if any(r.ok for r in results) else 1
 
 
