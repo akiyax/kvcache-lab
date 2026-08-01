@@ -23,11 +23,29 @@ Redis、S3 等）放温冷数据，跨请求、跨实例复用前缀缓存以降
 | 内存 | 32GB |
 | 系统 | Windows 11 + WSL2 Ubuntu |
 | 容器 | Docker Desktop（GPU passthrough） |
-| 模型 | Qwen2.5-7B-Instruct-AWQ（约 5.5GB 显存，给 KV Cache 留足空间） |
+
+## 模型矩阵
+
+实验台是模型无关的：模型在 `experiments/models.yaml` 中注册，压测与实验脚本统一用
+`--model <name>` 切换。选型原则：**每个模型代表一条不同的 KV Cache 技术路线**（侧重
+国产主流），同一组卸载实验跑下来即可横向对比不同方案对存储层的影响。
+
+| 模型 | KV 方案 | 定位 |
+|------|---------|------|
+| Qwen2.5-7B-Instruct-AWQ | GQA（4 KV heads，KV 很省） | 国产第一主流，基线 |
+| GLM-4-9B-Chat（GPTQ/AWQ） | 极限 GQA（仅 2 KV heads） | GQA 压缩的极端案例 |
+| DeepSeek-V2-Lite-Chat（4-bit） | MLA + MoE，KV 只存压缩潜在向量 | 国产最重要的差异化方案 |
+| Llama-3.1-8B-Instruct-AWQ | GQA（8 KV heads，KV 最肥） | 国际对照组 |
+| GPT-OSS-20B（MXFP4，可选） | 滑动窗口 + attention sink | 有余力再跑，不占主线 |
+
+四个主线模型在「单 token KV 体积」上构成完整光谱（GLM 最省 → Qwen → DeepSeek MLA
+→ Llama 最肥）。具体数值将由 Phase 1 的脚本从各模型 `config.json` 计算得出，
+不在此处手抄。
 
 ## 路线图
 
-- [ ] **Phase 1 — 基线**：WSL2 中部署 vLLM 服务，编写压测脚本，建立 TTFT / 吞吐基线
+- [ ] **Phase 1 — 基线**：WSL2 中部署 vLLM 服务，编写压测脚本，建立 TTFT / 吞吐基线；
+      编写「`config.json` → 单 token KV 体积」计算脚本，验证模型矩阵中的 KV 差异
 - [ ] **Phase 2 — 前缀缓存**：开启 prefix caching，用多轮长文档问答负载测量 KV 复用收益
 - [ ] **Phase 3 — vLLM 侧卸载**：接入 LMCache，依次实验 CPU offload → 本地磁盘 → Redis
       （Docker 容器模拟分布式存储），测量各层命中率与 TTFT 变化
