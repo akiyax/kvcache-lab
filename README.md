@@ -78,7 +78,8 @@ kvcache-lab/
 │   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
 ├── docs/
 │   ├── design.md                 # 总体设计（架构、负载、指标、风险）
-│   └── kv-cache-fundamentals.md  # KV Cache 原理笔记（QKV / GQA / MLA / 分层）
+│   ├── kv-cache-fundamentals.md  # 模型侧：KV 从哪来、有多大（QKV / GQA / MLA / 分层）
+│   └── kv-cache-serving.md       # 系统侧：怎么存、怎么复用、怎么搬（分块 / 前缀 / 卸载）
 └── README.md
 ```
 
