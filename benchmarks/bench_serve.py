@@ -8,15 +8,19 @@
     TTFT   首 token 延迟 —— 反映 prefill，受算力限制，也是前缀缓存收益的直接体现
     ITL    token 间延迟 —— 反映 decode，受显存带宽限制
 
-前缀控制（Phase 2 会用到）：
+负载为「长系统提示 + 长文档 + 不同问题」，素材见 benchmarks/prompts/。
 
-    默认每个请求的**开头**插入唯一标记，确保前缀缓存完全不命中，用于测干净基线。
-    传 --shared-prefix-len 则构造共享前缀 + 各自不同的问题，用于测缓存收益。
-    可变内容必须放在最后，否则前缀从第一块起就不同，命中率归零。
+前缀控制：
+
+    默认在**最开头**插入唯一标记，前缀缓存完全不命中，测纯 prefill 基线。
+    传 --shared 则所有请求共用同一段 system + doc，仅问题不同，可命中缓存。
+    可变内容必须放在末尾，否则前缀从第一块起就不同，命中率归零。
+
+    两次运行的差值即前缀缓存的收益。
 
 用法：
-    python benchmarks/bench_serve.py --model qwen --num-requests 32 --concurrency 8
-    python benchmarks/bench_serve.py --model qwen --shared-prefix-len 2000 -n 16 -c 4
+    python benchmarks/bench_serve.py --model qwen -n 32 -c 8
+    python benchmarks/bench_serve.py --model qwen -n 32 -c 8 --shared
 """
 
 from __future__ import annotations
@@ -28,12 +32,10 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
-FILLER = (
-    "推理系统需要在有限的显存中同时服务多个请求，缓存的管理策略直接决定了整体吞吐。"
-    "分层存储将热数据保留在高速介质中，冷数据下沉到容量更大但延迟更高的层级。"
-)
+PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 @dataclass
@@ -53,21 +55,43 @@ class Result:
         return (self.latency - self.ttft) / (self.output_tokens - 1) * 1000
 
 
-def build_prompt(index: int, input_len: int, shared_prefix_len: int) -> str:
-    """构造指定长度的提示词。
+class Corpus:
+    """从 benchmarks/prompts/ 载入的压测素材。"""
 
-    input_len 为字符数近似值——真实 token 数以服务端返回的 usage 为准，
-    因此近似不影响测量准确性。
+    def __init__(self, directory: Path):
+        def read(name: str) -> str:
+            path = directory / name
+            if not path.exists():
+                raise FileNotFoundError(f"缺少语料文件: {path}")
+            return path.read_text(encoding="utf-8").strip()
+
+        self.system = read("system.txt")
+        self.doc = read("doc-kvcache.txt")
+        self.questions = [
+            line.strip()
+            for line in read("questions.txt").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not self.questions:
+            raise ValueError("questions.txt 中没有有效问题")
+
+
+def build_prompt(index: int, corpus: Corpus, doc_chars: int, shared: bool) -> str:
+    """构造「长系统提示 + 文档 + 问题」的提示词。
+
+    问题按 index 轮转，确保各请求的可变部分不同（否则整条 prompt 完全一致，
+    连不该命中的基线模式也会命中）。
     """
-    if shared_prefix_len:
-        # 共享前缀在前，可变部分在后 —— 前缀缓存可命中
-        prefix = (FILLER * (shared_prefix_len // len(FILLER) + 1))[:shared_prefix_len]
-        return f"{prefix}\n\n问题 {index}：请概括上文要点。"
+    question = corpus.questions[index % len(corpus.questions)]
+    context = corpus.doc[:doc_chars] if doc_chars else corpus.doc
+    body = f"{corpus.system}\n\n{context}\n\n问题：{question}\n回答："
 
-    # 唯一标记置于**开头**，确保前缀缓存完全不命中（干净基线）
-    unique = f"[请求 {index} 会话 {time.time_ns()}] "
-    body = (FILLER * (input_len // len(FILLER) + 1))[:max(0, input_len - len(unique))]
-    return unique + body + "\n\n请简要回答上述内容涉及的主题。"
+    if shared:
+        # system + doc 对所有请求完全相同，仅末尾问题不同 —— 前缀缓存可命中
+        return body
+
+    # 唯一标记置于**最开头**，前缀从第一块起即不同，确保完全不命中
+    return f"[会话 {index}-{time.time_ns()}]\n{body}"
 
 
 def one_request(url: str, model: str, prompt: str, output_len: int,
@@ -121,7 +145,7 @@ def one_request(url: str, model: str, prompt: str, output_len: int,
         conn.close()
 
 
-def run(args) -> list[Result]:
+def run(args, corpus: Corpus) -> list[Result]:
     """以固定并发数发送 num_requests 个请求。"""
     results: list[Result] = []
     lock = threading.Lock()
@@ -135,7 +159,7 @@ def run(args) -> list[Result]:
                 if i >= args.num_requests:
                     return
                 next_index[0] += 1
-            prompt = build_prompt(i, args.input_len, args.shared_prefix_len)
+            prompt = build_prompt(i, corpus, args.doc_chars, args.shared)
             r = one_request(args.url, args.model, prompt, args.output_len, args.timeout)
             with lock:
                 results.append(r)
@@ -167,10 +191,10 @@ def report(results: list[Result], wall: float, args) -> None:
     print(f"模型      {args.model}")
     print(f"并发      {args.concurrency}   请求数 {args.num_requests}"
           f"   成功 {len(ok)}   失败 {len(failed)}")
-    if args.shared_prefix_len:
-        print(f"共享前缀  {args.shared_prefix_len} 字符（前缀缓存可命中）")
+    if args.shared:
+        print("前缀模式  共享 system + doc，仅问题不同（缓存可命中）")
     else:
-        print("共享前缀  无（每请求首块唯一，确保不命中）")
+        print("前缀模式  首块含唯一标记（确保完全不命中）")
     print("=" * 58)
 
     if not ok:
@@ -207,19 +231,28 @@ def main() -> int:
     p.add_argument("--model", required=True, help="服务端注册的模型名")
     p.add_argument("-n", "--num-requests", type=int, default=32)
     p.add_argument("-c", "--concurrency", type=int, default=8)
-    p.add_argument("--input-len", type=int, default=1024, help="提示词字符数（近似）")
     p.add_argument("--output-len", type=int, default=128, help="max_tokens")
-    p.add_argument("--shared-prefix-len", type=int, default=0,
-                   help="共享前缀字符数；>0 时构造可命中前缀缓存的负载")
+    p.add_argument("--doc-chars", type=int, default=4000,
+                   help="取文档前 N 字符作为上下文（0 表示全文）")
+    p.add_argument("--shared", action="store_true",
+                   help="共享 system + doc 前缀，仅问题不同（测缓存命中收益）")
+    p.add_argument("--prompts", type=Path, default=PROMPT_DIR, help="语料目录")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--warmup", type=int, default=1, help="正式测量前的预热请求数")
     args = p.parse_args()
 
+    try:
+        corpus = Corpus(args.prompts)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"错误: {exc}")
+        return 1
+
     if args.warmup:
         print(f"预热 {args.warmup} 个请求...")
         for i in range(args.warmup):
+            # 预热一律用不命中模式，避免污染后续的共享前缀测量
             r = one_request(args.url, args.model,
-                            build_prompt(-i - 1, args.input_len, 0),
+                            build_prompt(-i - 1, corpus, args.doc_chars, False),
                             args.output_len, args.timeout)
             if not r.ok:
                 print(f"预热失败: {r.error}")
@@ -227,7 +260,7 @@ def main() -> int:
 
     print(f"压测中（并发 {args.concurrency}）...")
     start = time.perf_counter()
-    results = run(args)
+    results = run(args, corpus)
     report(results, time.perf_counter() - start, args)
     return 0 if any(r.ok for r in results) else 1
 
