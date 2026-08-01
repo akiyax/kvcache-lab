@@ -1,7 +1,7 @@
 """kv_size 的测试。
 
 断言的期望值来自 experiments/configs/ 中的真实 config.json 快照，
-每个用例同时钉住一个已知陷阱（见 docs/kv-cache-fundamentals.md 第 8 节）。
+每个用例同时钉住一个已知陷阱（见 docs/kv-cache/03-sizing.md 第 3 节）。
 
 运行：python -m unittest discover -s benchmarks -v
 """
