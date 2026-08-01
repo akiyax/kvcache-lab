@@ -43,6 +43,14 @@ ARGS=(
 TIER="${LMCACHE:-off}"
 
 if [ "$TIER" != "off" ]; then
+  # Python 内置 hash() 对字符串每进程随机加种。单机自存自取无碍，但跨进程/跨机器
+  # 共享时同样内容会算出不同的键，命中率**静默归零**——不报错、不崩溃，只是全部
+  # 走重算。Redis 与 MinIO 层必须固定种子。详见 docs/phase3-offload.md 第 5 节。
+  #
+  # 注：CPU 层的已记录结果是在加入本行**之前**测得的。它不改变单进程内的命中行为，
+  # 故不影响那批数据的可复现性。
+  export PYTHONHASHSEED=0
+
   export LMCACHE_CHUNK_SIZE=256          # 每块 256 token ≈ 14.7 MiB（Qwen）
   export LMCACHE_LOCAL_CPU=True
   export LMCACHE_MAX_LOCAL_CPU_SIZE=4.0  # GB；WSL 共 15 GiB，留足余量

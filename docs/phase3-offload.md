@@ -174,7 +174,83 @@ CPU 层跑通只证明了「快」，但真要推广到分布式存储，判据�
 
 ---
 
-## 5. 环境记录
+## 5. 卸载层是怎么存和找的
+
+读 LMCache 0.5.2 源码（`lmcache/v1/token_database.py`）确认，非推测。
+Phase 5 自己写 KV Connector 时需要实现同一套机制。
+
+### 存：按 token 数切成定长块
+
+KV 不整段存，切成 `chunk_size` 大小的块独立存取。本实验 `chunk_size=256`，
+对 Qwen 一块是 `256 × 57,344 = 14.7 MiB`。
+
+```python
+end = len(tokens) if save_unfull_chunk else (len(tokens) - len(tokens) % chunk_size)
+for i in range(0, end, chunk_size):
+    yield tokens[i : i + chunk_size]
+```
+
+`save_unfull_chunk` 默认 `False`——**凑不满一整块的尾巴直接丢弃**。这正是实测
+命中率 64.0% 低于理论上限 66.7% 的原因。
+
+### 找：链式哈希
+
+每块的键不只由本块内容决定，还把**前一块的键**揉进去：
+
+```python
+def _prefix_hash(self, token_chunks):
+    prefix_hash = self._get_init_hash()
+    for token_chunk in token_chunks:
+        prefix_hash = self._hash_tokens(token_chunk, prefix_hash)   # ← 链式
+        yield prefix_hash
+```
+
+```
+键₁ = H(起始值, 块₁)
+键₂ = H(键₁,    块₂)      ← 依赖块₁
+键₃ = H(键₂,    块₃)      ← 依赖块₁、块₂
+```
+
+**每个键编码的是「从第一个 token 到这里的完整前缀」，而非本块内容。** 查找从第一块
+开始逐块进行，遇到第一个未命中即停止——后续键都建立在这一块之上，前面断了后面
+必然对不上。
+
+这解释了本实验的构造为何成立：12 个会话仅开头的会话标记不同，但**块₁ 不同 →
+键₁ 不同 → 整条链全部错开**，彼此一块都命不中；而同一会话重访时开头完全一致，
+整条链一路对上，直到问题不同的那一块才断。
+
+> `docs/notes/04-serving.md` 里「可变内容必须放在末尾」那条规则，机制就在这里——
+> 不是约定俗成，是链式哈希的数学必然。
+
+### 键的命名空间
+
+除 token 外，键还含**模型名、KV 精度、world_size、worker_id**（`CacheEngineKey`）。
+同样的文字在不同模型下 KV 完全不同，键必须区分——多模型共用一套分布式存储时这是必需的。
+
+### ⚠ 跨进程共享前必须设 `PYTHONHASHSEED`
+
+源码中的警告：
+
+```
+Using builtin hash without PYTHONHASHSEED set.
+For production environments (non-testing scenarios), you MUST set
+PYTHONHASHSEED to ensure consistent hashing across processes.
+```
+
+Python 内置 `hash()` 对字符串**每个进程的随机种子不同**。单机自存自取无碍，但
+**一旦跨进程或跨机器共享缓存，同样的内容会算出不同的键，命中率直接归零**。
+
+本阶段 CPU 层用的正是 `builtin` 且未设种子——单机无影响，但**做 Redis 层与
+Phase 5 的 MinIO 时必须先处理**，否则会得到一个「看起来在正常工作、实际永不命中」
+的系统：不报错、不崩溃，只是所有请求都走重算路径。
+
+可选做法：设 `export PYTHONHASHSEED=0`，或把 `pre_caching_hash_algorithm` 换成
+`sha256_cbor` 之类的确定性算法（LMCache 会优先向 vLLM 借该函数，见
+`_get_vllm_hash_func`）。
+
+---
+
+## 6. 环境记录
 
 ### LMCache 自报的 KV 形状印证了公式
 
@@ -200,9 +276,11 @@ CPU 仅 18%——是 WSL 虚拟机自身卡死，只能 `wsl --shutdown` 重启�
 
 ---
 
-## 6. 待办
+## 7. 待办
 
 - [ ] 本地磁盘层（`LMCACHE_LOCAL_DISK`）
+- [ ] **Redis 层前先解决哈希确定性**：设 `PYTHONHASHSEED` 或换确定性哈希算法，
+      否则跨进程键不一致，命中率会静默归零（详见第 5 节）
 - [ ] Redis 层（`LMCACHE_REMOTE_URL`，需起容器）
 - [ ] 写入成本测量——需改压测脚本，区分读路径与写路径的开销
 - [ ] 命中率扫描：变化会话数，画出命中率与 TTFT 降幅的关系
