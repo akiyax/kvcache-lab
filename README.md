@@ -89,11 +89,14 @@ kvcache-lab/
 │   └── prompts/         # 压测语料（长系统提示 + 长文档 + 问题集）
 ├── experiments/
 │   ├── models.yaml      # 模型注册表（仓库、启动参数、验证状态）
-│   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
+│   ├── serve-phase3.sh  # Phase 3 卸载实验的服务端（四层可切换）
+│   ├── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
+│   └── results/         # 压测结果摘要（文档结论的原始证据）
 ├── patches/             # 需打在依赖上的补丁及其上游状态说明
 ├── docs/
 │   ├── design.md                 # 总体设计（架构、负载、指标、风险）
 │   ├── phase1-baseline.md        # Phase 1 记录：环境、WSL 踩坑、基线数据
+│   ├── phase3-offload.md         # Phase 3 记录：卸载实验设计与分层结果
 │   ├── mla-verification.md       # MLA 实机验证：公式核对、vLLM 上游 bug
 │   └── notes/                    # 学习笔记
 │       ├── README.md             # 索引 + 速查页（缩写、公式、数据、陷阱）

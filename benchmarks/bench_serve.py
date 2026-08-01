@@ -22,13 +22,20 @@
 
     默认在**最开头**插入唯一标记，前缀缓存完全不命中，测纯 prefill 基线。
     传 --shared 则所有请求共用同一段 system + doc，仅问题不同，可命中缓存。
+    传 --sessions N 则 N 个会话轮转，会话内前缀可复用——用于测 KV 卸载收益。
     可变内容必须放在末尾，否则前缀从第一块起就不同，命中率归零。
 
-    两次运行的差值即前缀缓存的收益。
+    默认 vs --shared 的差值即前缀缓存的收益（Phase 2）。
+    --sessions 下开关卸载层的差值即卸载的收益（Phase 3）。
+
+⚠️ 比较**总耗时**前必须归一化输出长度。贪心解码（temperature=0）并不保证
+   逐 token 确定，命中与未命中两条路径的浮点归约顺序不同，可能提前遇到 EOS。
+   吞吐按 token 计算不受影响，墙钟时间会。详见 docs/phase3-offload.md 第 3 节。
 
 用法：
     python benchmarks/bench_serve.py --model qwen -n 32 -c 8
     python benchmarks/bench_serve.py --model qwen -n 32 -c 8 --shared
+    python benchmarks/bench_serve.py --model qwen -n 36 -c 1 --sessions 12
 """
 
 from __future__ import annotations
@@ -85,15 +92,42 @@ class Corpus:
             raise ValueError("questions.txt 中没有有效问题")
 
 
-def build_prompt(index: int, corpus: Corpus, doc_chars: int, shared: bool) -> str:
+def build_prompt(
+    index: int,
+    corpus: Corpus,
+    doc_chars: int,
+    shared: bool,
+    sessions: int = 0,
+) -> str:
     """构造「长系统提示 + 文档 + 问题」的提示词。
 
     问题按 index 轮转，确保各请求的可变部分不同（否则整条 prompt 完全一致，
     连不该命中的基线模式也会命中）。
+
+    三种前缀模式：
+
+    ==========  ================================  ==========================
+    模式        前缀                              用途
+    ==========  ================================  ==========================
+    默认        每请求唯一（含时间戳）            测纯 prefill 成本，零命中
+    shared      全部请求共享同一段               测前缀缓存收益（Phase 2）
+    sessions=N  N 个会话轮转，会话内前缀不变     测 KV 卸载收益（Phase 3）
+    ==========  ================================  ==========================
+
+    **为什么 Phase 3 需要第三种**：前两种都测不出卸载的价值。shared 模式只占用
+    一份前缀，永远装得下 GPU 缓存；默认模式的前缀从不复用，缓存在哪一层都没意义。
+    卸载要产生收益，必须同时满足「前缀会被复用」与「总量超过 GPU 容量」——
+    N 个会话轮转正是如此，也贴近生产形态（多个用户的对话历史并存、轮流被访问）。
     """
     question = corpus.questions[index % len(corpus.questions)]
     context = corpus.doc[:doc_chars] if doc_chars else corpus.doc
     body = f"{corpus.system}\n\n{context}\n\n问题：{question}\n回答："
+
+    if sessions > 0:
+        # 会话标记置于最开头且**不含时间戳**：同一会话的多次访问前缀完全一致，
+        # 可复用；不同会话之间从第一块起即不同，互不命中。
+        # 定宽格式化，保证各会话的前缀长度一致，不引入长度差异干扰测量。
+        return f"[会话 {index % sessions:04d}]\n{body}"
 
     if shared:
         # system + doc 对所有请求完全相同，仅末尾问题不同 —— 前缀缓存可命中
@@ -226,7 +260,9 @@ def run(args, corpus: Corpus) -> list[Result]:
                     if i >= args.num_requests:
                         return
                     next_index[0] += 1
-                prompt = build_prompt(i, corpus, args.doc_chars, args.shared)
+                prompt = build_prompt(
+                    i, corpus, args.doc_chars, args.shared, args.sessions
+                )
                 r = one_request(conn, args.model, prompt, args.output_len)
                 if not r.ok:
                     # 连接状态可能已损坏，重建后继续
@@ -286,7 +322,10 @@ def report(results: list[Result], wall: float, args) -> None:
     print(f"模型      {args.model}")
     print(f"并发      {args.concurrency}   请求数 {args.num_requests}"
           f"   成功 {len(ok)}   失败 {len(failed)}")
-    if args.shared:
+    if args.sessions > 0:
+        print(f"前缀模式  {args.sessions} 个会话轮转，会话内前缀可复用"
+              f"（每会话被访问约 {args.num_requests / args.sessions:.1f} 次）")
+    elif args.shared:
         print("前缀模式  共享 system + doc，仅问题不同（缓存可命中）")
     else:
         print("前缀模式  首块含唯一标记（确保完全不命中）")
@@ -335,6 +374,11 @@ def main() -> int:
                    help="取文档前 N 字符作为上下文（0 表示全文）")
     p.add_argument("--shared", action="store_true",
                    help="共享 system + doc 前缀，仅问题不同（测缓存命中收益）")
+    # Phase 3：制造「前缀会被复用、但总量超过 GPU 缓存」的条件，否则卸载收益恒为零。
+    # 会话数应满足 sessions × 单前缀 token 数 > GPU KV cache 容量。
+    p.add_argument("--sessions", type=int, default=0,
+                   help="N 个会话轮转，会话内前缀可复用（测 KV 卸载收益）"
+                        "；优先级高于 --shared")
     p.add_argument("--prompts", type=Path, default=PROMPT_DIR, help="语料目录")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--warmup", type=int, default=1, help="正式测量前的预热请求数")

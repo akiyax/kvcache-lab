@@ -11,10 +11,14 @@ models/
 *.gguf
 *.bin
 
-# 实验产物
+# 实验产物（体积大或可重跑的中间结果）
 results/
 *.log
 logs/
+
+# 例外：压测结果摘要是文档结论的证据，且仅数十行，必须入库。
+# 若不入库，docs/ 中「原始输出见 experiments/results/」的引用即成空链。
+!experiments/results/
 
 # IDE / OS
 .vscode/
