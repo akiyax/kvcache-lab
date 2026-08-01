@@ -76,7 +76,9 @@ kvcache-lab/
 ├── benchmarks/          # 压测与测量脚本（TTFT、吞吐、缓存命中率）
 ├── experiments/         # 各 Phase 的部署配置与实验脚本
 │   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
-├── docs/                # 设计文档与实验记录
+├── docs/
+│   ├── design.md                 # 总体设计（架构、负载、指标、风险）
+│   └── kv-cache-fundamentals.md  # KV Cache 原理笔记（QKV / GQA / MLA / 分层）
 └── README.md
 ```
 
