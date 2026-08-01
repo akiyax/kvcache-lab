@@ -1,0 +1,89 @@
+# 模型注册表
+#
+# 压测与实验脚本统一用 --model <key> 切换。
+#
+# 字段说明：
+#   repo / revision  HuggingFace 仓库与快照时锁定的 commit
+#   config           本地 config.json 快照，KV 体积由 benchmarks/kv_size.py 从中计算
+#                    （此处不记录 KV 数值，避免与脚本产生两份真相）
+#   scheme           注意力方案，详见 docs/notes/02-schemes.md
+#   serve            vLLM 启动参数。标注 [待验证] 的尚未实跑确认
+#   status           planned / verified / blocked
+#
+# 硬件约束（RTX 4080）：显存 16376 MiB，Windows 桌面常占用约 2.9 GiB，
+# 实际可用约 13.1 GiB。max_model_len 与并发数需据此调整。
+
+defaults:
+  # 显存紧张是本实验台的常态，也是制造「缓存放不下需卸载」条件的手段
+  gpu_memory_utilization: 0.90
+  dtype: auto
+  kv_cache_dtype: auto        # Phase 3 会实验 fp8
+
+models:
+
+  qwen2.5-7b-awq:
+    repo: Qwen/Qwen2.5-7B-Instruct-AWQ
+    revision: b25037543e93
+    config: experiments/configs/qwen2.5-7b-instruct-awq.json
+    scheme: GQA
+    role: 国产第一主流，Phase 1 基线模型
+    serve:
+      max_model_len: 32768      # config 上限即 32768
+    status: planned
+
+  glm-4-9b:
+    repo: zai-org/glm-4-9b-chat
+    revision: bd8234fe5e0c
+    config: experiments/configs/glm-4-9b-chat.json
+    scheme: GQA
+    role: GQA 压缩的极端案例（仅 2 KV 组）
+    serve:
+      trust_remote_code: true   # config 含 auto_map，需仓库自带建模代码
+      max_model_len: 32768      # [待验证] config 支持 131072，受显存限制需下调
+    notes: >
+      快照取自未量化仓库（量化不改变 KV 形状，用于计算等价）。
+      实际部署需另选 GPTQ/AWQ 仓库，届时更新 repo 与 revision。
+      原仓库 THUDM/glm-4-9b-chat 已更名为 zai-org/glm-4-9b-chat。
+    status: planned
+
+  deepseek-v2-lite:
+    repo: deepseek-ai/DeepSeek-V2-Lite-Chat
+    revision: 85864749cd61
+    config: experiments/configs/deepseek-v2-lite-chat.json
+    scheme: MLA
+    role: 国产最重要的差异化方案，最贴合 KV 卸载岗位
+    serve:
+      trust_remote_code: true   # config 含 auto_map
+      max_model_len: 32768      # [待验证] config 支持 163840
+    notes: >
+      MLA + MoE。4-bit 量化版在 vLLM 上的支持可能不稳，需试多个量化仓库；
+      跑不通时的备选是仅做 MLA 理论分析。
+      vLLM 中 MLA 的实际存储布局是否与理论公式一致，需 Phase 1 实测核对。
+    status: planned
+
+  llama-3.1-8b-awq:
+    repo: hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
+    revision: db1f81ad4b8c
+    config: experiments/configs/llama-3.1-8b-instruct-awq.json
+    scheme: GQA
+    role: 国际对照组，KV 最肥（4.2 倍于 MLA）
+    serve:
+      max_model_len: 32768      # [待验证] config 支持 131072
+    notes: >
+      官方 meta-llama 仓库为 gated，采用社区 AWQ 量化版，架构参数一致。
+      该快照 use_cache 为 false，系量化打包遗留，起服务时留意。
+    status: planned
+
+  gpt-oss-20b:
+    repo: openai/gpt-oss-20b
+    revision: 6cee5e81ee83
+    config: experiments/configs/gpt-oss-20b.json
+    scheme: GQA + SWA
+    role: 滑动窗口路线，长上下文下 KV 最省；可选，不占主线
+    serve:
+      max_model_len: 32768      # [待验证] config 支持 131072
+    notes: >
+      原生 MXFP4 量化，注意力层不量化（modules_to_not_convert 已排除 self_attn）。
+      24 层中 12 层滑窗（窗口 128）、12 层全注意力交替。
+      vLLM 对滑窗的实现方式是否与理论模型一致，需实测核对。
+    status: planned
