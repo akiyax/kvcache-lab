@@ -44,9 +44,18 @@ Redis、S3 等）放温冷数据，跨请求、跨实例复用前缀缓存以降
 DeepSeek MLA 30.4 KiB  <  GLM 40.0  <  Qwen 56.0  <  Llama 128.0 KiB
 ```
 
-上表数值由 `experiments/configs/` 中的 `config.json` 快照计算得出（假设 KV 为
-fp16/bf16，即 2 字节/元素，vLLM 默认；开启 `--kv-cache-dtype fp8` 可再减半）。
-Phase 1 的计算脚本会把这一步固化为一条可复现的命令。
+上表数值由 [`benchmarks/kv_size.py`](benchmarks/kv_size.py) 从 `experiments/configs/`
+的 `config.json` 快照计算得出，零依赖、可复现：
+
+```bash
+python benchmarks/kv_size.py --all              # 对照表
+python benchmarks/kv_size.py qwen2.5-7b-instruct-awq -v   # 查看推导过程
+python benchmarks/kv_size.py qwen2.5-7b-instruct-awq --gpu 16 --weights 5.5
+#   → 显存预算 8.90 GiB，32K 上下文下可并发约 5 路
+```
+
+假设 KV 为 fp16/bf16（2 字节/元素，vLLM 默认）；传 `--kv-dtype fp8` 可见体积减半、
+并发翻倍的效果。
 
 † GPT-OSS 为两段式：24 层中 12 层全注意力随上下文线性增长（24.0 KiB/token），
 另 12 层滑动窗口在 128 token 处封顶（合计 3 MiB 常数），因此长上下文下反而最省。
@@ -74,6 +83,8 @@ Phase 1 的计算脚本会把这一步固化为一条可复现的命令。
 ```
 kvcache-lab/
 ├── benchmarks/          # 压测与测量脚本（TTFT、吞吐、缓存命中率）
+│   ├── kv_size.py       # config.json → 单 token KV 体积（零依赖）
+│   └── test_kv_size.py  # 单元测试：python -m unittest discover -s benchmarks
 ├── experiments/         # 各 Phase 的部署配置与实验脚本
 │   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
 ├── docs/
