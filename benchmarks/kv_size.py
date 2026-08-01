@@ -317,10 +317,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kv-dtype", choices=["fp16", "fp8"],
                    help="覆盖 KV 精度（fp8 即每元素 1 字节）")
     p.add_argument("-v", "--verbose", action="store_true", help="显示推导过程")
-    p.add_argument("--gpu", type=float, help="显存容量 GiB，用于估算可并发路数")
+    p.add_argument("--gpu", type=float,
+                   help="显存**总量** GiB（非空闲量）——vLLM 的 utilization 按总量计算")
     p.add_argument("--weights", type=float, default=0.0, help="模型权重占用 GiB")
     p.add_argument("--util", type=float, default=0.9,
                    help="gpu-memory-utilization（默认 0.9）")
+    p.add_argument("--overhead", type=float, default=1.6,
+                   help="峰值激活 + CUDAGraph + non-torch 的 GiB 开销（默认 1.6，"
+                        "实测自 Qwen2.5-7B-AWQ @4080：激活 1.04 + 图 0.48 + 其他 0.06）")
     args = p.parse_args(argv)
 
     dtype_bytes = {"fp16": 2, "fp8": 1}.get(args.kv_dtype)
@@ -343,15 +347,20 @@ def main(argv: list[str] | None = None) -> int:
               f"  @{args.ctx:,} = {human(total_bytes(spec, args.ctx))}")
 
     if args.gpu:
-        budget = args.gpu * args.util - args.weights
+        budget = args.gpu * args.util - args.weights - args.overhead
         per_req = total_bytes(spec, args.ctx) / (1 << 30)
-        print(f"\n显存预算: {args.gpu} GiB × {args.util} - 权重 {args.weights} GiB"
-              f" = {budget:.2f} GiB 可用于 KV")
-        print(f"单请求 @{args.ctx:,} tokens: {per_req:.2f} GiB")
+        print(f"\n显存预算  {args.gpu} × {args.util} = {args.gpu * args.util:.2f} GiB")
+        print(f"  - 权重                {args.weights:.2f} GiB")
+        print(f"  - 激活/图/其他开销     {args.overhead:.2f} GiB")
+        print(f"  = 可用于 KV           {budget:.2f} GiB")
+        print(f"\n单请求 @{args.ctx:,} tokens: {per_req:.2f} GiB")
         if budget <= 0:
-            print("→ 权重已超出预算，无法容纳 KV")
+            print("→ 权重与开销已超出预算，无法容纳 KV")
         else:
-            print(f"→ 可并发约 {int(budget / per_req)} 路")
+            print(f"→ 可并发约 {budget / per_req:.1f} 路"
+                  f"（KV 容量约 {int(budget * (1 << 30) / spec.bytes_per_token):,} tokens）")
+        print("\n注：vLLM 按显存**总量**而非空闲量计算 utilization，且实际分配可能"
+              "略高于此估算（它基于启动时的真实空闲量做 profiling）。")
 
     return 0
 
