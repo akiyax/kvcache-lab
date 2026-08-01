@@ -89,7 +89,7 @@ kvcache-lab/
 │   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
 ├── docs/
 │   ├── design.md                 # 总体设计（架构、负载、指标、风险）
-│   └── kv-cache/                 # KV Cache 笔记
+│   └── notes/                    # 学习笔记
 │       ├── README.md             # 索引 + 速查页（缩写、公式、数据、陷阱）
 │       ├── 01-attention.md       # QKV、为什么缓存、多头、层与维度
 │       ├── 02-schemes.md         # MHA/MQA/GQA/MLA/SWA、稀疏与线性混合、2026 格局

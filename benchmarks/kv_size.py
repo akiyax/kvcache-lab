@@ -9,7 +9,7 @@
                      不乘 2（K/V 联合压缩），不乘头数（全头共享）
     滑动窗口          全注意力层线性增长 + 滑窗层在 window 处封顶
 
-公式推导与已知字段陷阱见 docs/kv-cache/03-sizing.md。
+公式推导与已知字段陷阱见 docs/notes/03-sizing.md。
 
 用法：
     python benchmarks/kv_size.py --all
