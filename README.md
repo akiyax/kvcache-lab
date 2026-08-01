@@ -30,17 +30,30 @@ Redis、S3 等）放温冷数据，跨请求、跨实例复用前缀缓存以降
 `--model <name>` 切换。选型原则：**每个模型代表一条不同的 KV Cache 技术路线**（侧重
 国产主流），同一组卸载实验跑下来即可横向对比不同方案对存储层的影响。
 
-| 模型 | KV 方案 | 定位 |
-|------|---------|------|
-| Qwen2.5-7B-Instruct-AWQ | GQA（4 KV heads，KV 很省） | 国产第一主流，基线 |
-| GLM-4-9B-Chat（GPTQ/AWQ） | 极限 GQA（仅 2 KV heads） | GQA 压缩的极端案例 |
-| DeepSeek-V2-Lite-Chat（4-bit） | MLA + MoE，KV 只存压缩潜在向量 | 国产最重要的差异化方案 |
-| Llama-3.1-8B-Instruct-AWQ | GQA（8 KV heads，KV 最肥） | 国际对照组 |
-| GPT-OSS-20B（MXFP4，可选） | 滑动窗口 + attention sink | 有余力再跑，不占主线 |
+| 模型 | KV 方案 | 单 token KV | @32K 上下文 | 定位 |
+|------|---------|------------|------------|------|
+| Qwen2.5-7B-Instruct-AWQ | GQA（4 KV heads） | 56.0 KiB | 1.75 GiB | 国产第一主流，基线 |
+| GLM-4-9B-Chat（GPTQ/AWQ） | 极限 GQA（仅 2 KV heads） | 40.0 KiB | 1.25 GiB | GQA 压缩的极端案例 |
+| DeepSeek-V2-Lite-Chat（4-bit） | MLA + MoE，KV 只存压缩潜在向量 | 30.4 KiB | 0.95 GiB | 国产最重要的差异化方案 |
+| Llama-3.1-8B-Instruct-AWQ | GQA（8 KV heads，KV 最肥） | 128.0 KiB | 4.00 GiB | 国际对照组 |
+| GPT-OSS-20B（MXFP4，可选） | 滑动窗口（128）+ attention sink | 24.0 KiB † | 0.75 GiB | 有余力再跑，不占主线 |
 
-四个主线模型在「单 token KV 体积」上构成完整光谱（GLM 最省 → Qwen → DeepSeek MLA
-→ Llama 最肥）。具体数值将由 Phase 1 的脚本从各模型 `config.json` 计算得出，
-不在此处手抄。
+四个主线模型在「单 token KV 体积」上构成完整光谱，首尾相差 **4.2 倍**：
+
+```
+DeepSeek MLA 30.4 KiB  <  GLM 40.0  <  Qwen 56.0  <  Llama 128.0 KiB
+```
+
+上表数值由 `experiments/configs/` 中的 `config.json` 快照计算得出（假设 KV 为
+fp16/bf16，即 2 字节/元素，vLLM 默认；开启 `--kv-cache-dtype fp8` 可再减半）。
+Phase 1 的计算脚本会把这一步固化为一条可复现的命令。
+
+† GPT-OSS 为两段式：24 层中 12 层全注意力随上下文线性增长（24.0 KiB/token），
+另 12 层滑动窗口在 128 token 处封顶（合计 3 MiB 常数），因此长上下文下反而最省。
+
+⚠️ DeepSeek-V2-Lite 的 config 同时含有 `num_key_value_heads: 16` 等 GQA 风格字段，
+误用 GQA 公式会算出 270 KiB/token——是 MLA 真实值的 **8.9 倍**。KV 体积计算必须先按
+`model_type` 分支选择公式，详见 [`experiments/configs/README.md`](experiments/configs/README.md)。
 
 ## 路线图
 
@@ -60,9 +73,10 @@ Redis、S3 等）放温冷数据，跨请求、跨实例复用前缀缓存以降
 
 ```
 kvcache-lab/
-├── benchmarks/    # 压测与测量脚本（TTFT、吞吐、缓存命中率）
-├── experiments/   # 各 Phase 的部署配置与实验脚本
-├── docs/          # 设计文档与实验记录
+├── benchmarks/          # 压测与测量脚本（TTFT、吞吐、缓存命中率）
+├── experiments/         # 各 Phase 的部署配置与实验脚本
+│   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
+├── docs/                # 设计文档与实验记录
 └── README.md
 ```
 
