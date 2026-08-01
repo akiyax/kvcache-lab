@@ -84,11 +84,17 @@ python benchmarks/kv_size.py qwen2.5-7b-instruct-awq --gpu 16 --weights 5.5
 kvcache-lab/
 ├── benchmarks/          # 压测与测量脚本（TTFT、吞吐、缓存命中率）
 │   ├── kv_size.py       # config.json → 单 token KV 体积（零依赖）
-│   └── test_kv_size.py  # 单元测试：python -m unittest discover -s benchmarks
-├── experiments/         # 各 Phase 的部署配置与实验脚本
+│   ├── bench_serve.py   # TTFT/吞吐压测，读取前缀缓存命中率（必须在 WSL 内运行）
+│   ├── test_kv_size.py  # 单元测试：python -m unittest discover -s benchmarks
+│   └── prompts/         # 压测语料（长系统提示 + 长文档 + 问题集）
+├── experiments/
+│   ├── models.yaml      # 模型注册表（仓库、启动参数、验证状态）
 │   └── configs/         # 各模型 config.json 快照（仅架构参数，不含权重）
+├── patches/             # 需打在依赖上的补丁及其上游状态说明
 ├── docs/
 │   ├── design.md                 # 总体设计（架构、负载、指标、风险）
+│   ├── phase1-baseline.md        # Phase 1 记录：环境、WSL 踩坑、基线数据
+│   ├── mla-verification.md       # MLA 实机验证：公式核对、vLLM 上游 bug
 │   └── notes/                    # 学习笔记
 │       ├── README.md             # 索引 + 速查页（缩写、公式、数据、陷阱）
 │       ├── 01-attention.md       # QKV、为什么缓存、多头、层与维度

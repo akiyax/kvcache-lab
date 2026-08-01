@@ -47,19 +47,27 @@ models:
     status: planned
 
   deepseek-v2-lite:
-    repo: deepseek-ai/DeepSeek-V2-Lite-Chat
-    revision: 85864749cd61
+    repo: TechxGenus/DeepSeek-V2-Lite-Chat-AWQ
+    revision: main
     config: experiments/configs/deepseek-v2-lite-chat.json
     scheme: MLA
     role: 国产最重要的差异化方案，最贴合 KV 卸载岗位
     serve:
-      trust_remote_code: true   # config 含 auto_map
-      max_model_len: 32768      # [待验证] config 支持 163840
+      # 原生支持 DeepseekV2ForCausalLM，不需要 trust_remote_code
+      max_model_len: 32768      # config 支持 163840，受显存限制下调
+      gpu_memory_utilization: 0.80   # 0.85 会在 CUDA graph 捕获时溢出
+    requires_patch: patches/vllm-0.26.0-mla-quantized-dtype.patch
     notes: >
-      MLA + MoE。4-bit 量化版在 vLLM 上的支持可能不稳，需试多个量化仓库；
-      跑不通时的备选是仅做 MLA 理论分析。
-      vLLM 中 MLA 的实际存储布局是否与理论公式一致，需 Phase 1 实测核对。
-    status: planned
+      MLA + MoE。原版 BF16 约 31 GB 装不下，改用 AWQ 4-bit 量化版（8.46 GiB）；
+      量化不改变 KV 形状，KV 相关字段与 config 快照完全一致。
+      backend 实测为 TRITON_MLA + FLASH_ATTN MLA prefill + MARLIN WNA16 MoE。
+      **必须打补丁**：vLLM 0.26.0 在 MLA + pack 量化下，前缀缓存命中或分块
+      prefill 会打死 EngineCore（上游 PR 均未合并）。该补丁同时是 Phase 3
+      使用 LMCache 的前置条件。
+      实测：util 0.85 → 5.07 GiB / 175,120 tokens；util 0.80 → 3.46 GiB /
+      119,328 tokens。两次均与 31,104 字节/token 的公式吻合，误差 < 0.1%。
+      详见 docs/mla-verification.md。
+    status: verified
 
   llama-3.1-8b-awq:
     repo: hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4

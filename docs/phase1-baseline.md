@@ -126,6 +126,9 @@ Maximum concurrency for 32,768 tokens per request: 4.57x
 
 **单 token 56.0 KiB 得到实测确认，GQA 公式正确。**
 
+> MLA 公式（DeepSeek-V2-Lite）另行验证，两次测量误差均 < 0.1%，
+> 见 [`mla-verification.md`](mla-verification.md)。
+
 ### 修正：`gpu_memory_utilization` 的语义
 
 初次预测（6.22 GiB / 约 3 路并发）偏低，原因是把 utilization 理解成了「按空闲显存计算」。

@@ -1,0 +1,20 @@
+Subject: [Bugfix][MLA] Use guarded dtype for kv_c_normed cast in _compute_prefill_context
+
+_compute_prefill_context() 上方已为量化层算好 _kv_b_proj_w_dtype（AWQ/GPTQ 的
+ColumnParallelLinear 只有 .qweight，没有 .weight），但这一行仍直接取原属性，
+导致 pack 量化的 MLA 模型在「有已算好的上下文需要注意」时崩溃 —— 即前缀缓存
+命中或分块 prefill。表现为首个请求成功、第二个共享前缀的请求打死 EngineCore。
+
+同文件 2377-2379 行是正确写法，可作对照。
+
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -2220,7 +2220,7 @@
+             if (
+                 use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
+             ) and _kv_b_proj_w_dtype != torch.uint8:
+-                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
++                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)
+
+             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
+             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(

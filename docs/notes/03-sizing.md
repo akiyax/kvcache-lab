@@ -141,7 +141,10 @@ python -m unittest discover -s benchmarks
 
 ## 待验证
 
-- [ ] vLLM 中 MLA 的实际存储布局是否与理论公式一致（部分 kernel 可能解压后再存）
+- [x] vLLM 中 MLA 的实际存储布局是否与理论公式一致（部分 kernel 可能解压后再存）
+      → **一致**。TRITON_MLA 后端按 `kv_lora_rank + qk_rope_head_dim` 存潜在向量，
+      未解压。两个 utilization 下各验证一次，误差 < 0.1%。
+      见 [`../mla-verification.md`](../mla-verification.md)。
 - [ ] 实际显存占用与理论计算的差距（分页开销、碎片、预留块）
 - [ ] `--kv-cache-dtype fp8` 的实际减半效果与质量影响
 - [ ] GPT-OSS 滑动窗口在 vLLM 中的实现方式与理论模型的一致性
